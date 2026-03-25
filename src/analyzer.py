@@ -8,6 +8,16 @@ A股自选股智能分析系统 - AI分析层
 1. 封装 LLM 调用逻辑（通过 LiteLLM 统一调用 Gemini/Anthropic/OpenAI 等）
 2. 结合技术面和消息面生成分析报告
 3. 解析 LLM 响应为结构化 AnalysisResult
+
+更新记录：
+- v3.10.1: Trading philosophy injection 覆盖全链路 (#810)
+           评分标准校准：防止中庸/偏低评分
+           三重量化买入信号融入评分逻辑
+           _call_litellm 增加限速保护延迟
+           batch_analyze 延迟从 2s 提升至 5s
+- v3.9.0:  REPORT_LANGUAGE 支持，AGENT_LITELLM_MODEL 解耦
+- v3.8.0:  LLM usage tracking
+- v3.5.0:  ReportType.BRIEF / 完整性校验重试
 """
 
 import json
@@ -22,14 +32,7 @@ from json_repair import repair_json
 from litellm import Router
 
 from src.agent.llm_adapter import get_thinking_extra_body
-from src.config import (
-    Config,
-    extra_litellm_params,
-    get_api_keys_for_model,
-    get_config,
-    get_configured_llm_models,
-    resolve_news_window_days,
-)
+from src.config import Config, get_config, get_api_keys_for_model, extra_litellm_params, get_configured_llm_models
 from src.storage import persist_llm_usage
 from src.data.stock_mapping import STOCK_NAME_MAP
 from src.schemas.report_schema import AnalysisReportSchema
@@ -512,12 +515,12 @@ class GeminiAnalyzer:
 - **乖离率公式**：(现价 - MA5) / MA5 × 100%
 - 乖离率 < 2%：最佳买点区间
 - 乖离率 2-5%：可小仓介入
-- 乖离率 > 5%：严禁追高！直接判定为"观望"
+- 乖离率 > 5%：严禁追高！通常判定为"观望"，强势趋势股或触发三重买入信号时可酌情极轻仓
 
 ### 2. 趋势交易（顺势而为）
-- **多头排列必须条件**：MA5 > MA10 > MA20
-- 只做多头排列的股票，空头排列坚决不碰
-- 均线发散上行优于均线粘合
+- **理想条件**：MA5 > MA10 > MA20 多头排列，这是最佳介入形态
+- 多头排列均线发散上行：趋势最强
+- 空头排列（MA5 < MA10 < MA20）：通常观望；**但若触发三重量化买入信号之一，可考虑极轻仓（1成以下）左侧博弈**
 - 趋势强度判断：看均线间距是否在扩大
 
 ### 3. 效率优先（筹码结构）
@@ -528,7 +531,7 @@ class GeminiAnalyzer:
 ### 4. 买点偏好（回踩支撑）
 - **最佳买点**：缩量回踩 MA5 获得支撑
 - **次优买点**：回踩 MA10 获得支撑
-- **观望情况**：跌破 MA20 时观望
+- **观望情况**：跌破 MA20 且无三重信号支撑时观望
 
 ### 5. 风险排查重点
 - 减持公告（股东、高管减持）
@@ -545,6 +548,13 @@ class GeminiAnalyzer:
 ### 7. 强势趋势股放宽
 - 强势趋势股（多头排列且趋势强度高、量能配合）可适当放宽乖离率要求
 - 此类股票可轻仓追踪，但仍需设置止损，不盲目追高
+
+### 8. 三重量化信号评分加成（v3.10.1新增）
+- 若当前分析触发【MACD底背离信号】：评分基础上调 +15 分
+- 若当前分析触发【无利空超跌共振信号】：评分基础上调 +12 分
+- 若当前分析触发【三连阴/五连阴衰竭信号】：评分基础上调 +8/+12 分
+- 同一股票可叠加多项信号加成，但最高评分上限仍为 100 分
+- 信号加成不代表直接买入，需结合整体判断
 
 ## 输出格式：决策仪表盘 JSON
 
@@ -655,7 +665,9 @@ class GeminiAnalyzer:
 }
 ```
 
-## 评分标准
+## 评分标准（校准版 v3.10.1 — 禁止评分永远中庸）
+
+> ⚠️ **评分分布要求**：你每次分析的评分必须如实反映股票现状，不可因"安全保守"而永远给出40-55的中间值。应合理出现高分（≥70）和低分（≤35）的情况。标准如下：
 
 ### 强烈买入（80-100分）：
 - ✅ 多头排列：MA5 > MA10 > MA20
@@ -663,23 +675,32 @@ class GeminiAnalyzer:
 - ✅ 缩量回调或放量突破
 - ✅ 筹码集中健康
 - ✅ 消息面有利好催化
+- ✅ 或触发三重量化信号中的2项以上（即使均线略不完美）
 
 ### 买入（60-79分）：
-- ✅ 多头排列或弱势多头
+- ✅ 多头排列或弱势多头（MA5/MA10 向上但MA20尚未走平）
 - ✅ 乖离率 <5%
 - ✅ 量能正常
 - ⚪ 允许一项次要条件不满足
+- ✅ 或：空头排列但触发三重量化买入信号之一且无重大利空（极轻仓博弈逻辑，给60-65分区间）
 
 ### 观望（40-59分）：
 - ⚠️ 乖离率 >5%（追高风险）
 - ⚠️ 均线缠绕趋势不明
-- ⚠️ 有风险事件
+- ⚠️ 有风险事件但尚未构成明确利空
+- ⚠️ 技术面中性，基本面无特别亮点或瑕疵
 
 ### 卖出/减仓（0-39分）：
-- ❌ 空头排列
-- ❌ 跌破MA20
+- ❌ 空头排列且无三重量化信号支撑
+- ❌ 跌破MA20且有明确利空
 - ❌ 放量下跌
-- ❌ 重大利空
+- ❌ 重大利空（减持/处罚/业绩变脸）
+
+### ⚠️ 评分防呆原则（v3.10.1）
+1. 若一只股票多头排列+量能配合+无利空，评分不得低于 62 分
+2. 若一只股票空头排列+放量下跌+有利空，评分不得高于 38 分
+3. 若三重量化买入信号中任意一项触发，评分最低保底 50 分（即使空头排列）
+4. 避免所有股票都落在 42-55 区间，这是评分失真的信号
 
 ## 决策仪表盘核心原则
 
@@ -687,7 +708,8 @@ class GeminiAnalyzer:
 2. **分持仓建议**：空仓者和持仓者给不同建议
 3. **精确狙击点**：必须给出具体价格，不说模糊的话
 4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
-5. **风险优先级**：舆情中的风险点要醒目标出"""
+5. **风险优先级**：舆情中的风险点要醒目标出
+6. **三重信号优先**：若本次分析触发任意三重量化信号，必须在核心结论和技术面中明确体现"""
 
     def __init__(self, api_key: Optional[str] = None):
         """Initialize LLM Analyzer via LiteLLM.
@@ -802,9 +824,10 @@ class GeminiAnalyzer:
         use_channel_router = self._has_channel_config(config)
 
         last_error = None
-        for model in models_to_try:
+        for idx, model in enumerate(models_to_try):
             try:
                 model_short = model.split("/")[-1] if "/" in model else model
+                logger.info(f"[LiteLLM] 尝试模型 ({idx+1}/{len(models_to_try)}): {model}")
                 call_kwargs: Dict[str, Any] = {
                     "model": model,
                     "messages": [
@@ -843,12 +866,19 @@ class GeminiAnalyzer:
                             "completion_tokens": response.usage.completion_tokens or 0,
                             "total_tokens": response.usage.total_tokens or 0,
                         }
+                    logger.info(f"[LiteLLM] {model} 调用成功")
                     return (response.choices[0].message.content, model, usage)
                 raise ValueError("LLM returned empty response")
 
             except Exception as e:
-                logger.warning(f"[LiteLLM] {model} failed: {e}")
+                err_str = str(e)
+                logger.warning(f"[LiteLLM] {model} 失败 ({idx+1}/{len(models_to_try)}): {err_str[:150]}")
                 last_error = e
+                # 限速/服务不可用：在切换下一个模型前等待，避免立即打爆备用模型
+                if any(kw in err_str for kw in ("429", "ServiceUnavailable", "503", "overloaded", "RateLimit", "rate_limit")):
+                    wait_sec = 5 * (idx + 1)  # 第1次失败等5s，第2次等10s
+                    logger.warning(f"[LiteLLM] 检测到限速/不可用错误，等待 {wait_sec}s 后切换模型...")
+                    time.sleep(wait_sec)
                 continue
 
         raise Exception(f"All LLM models failed (tried {len(models_to_try)} model(s)). Last error: {last_error}")
@@ -1117,52 +1147,7 @@ class GeminiAnalyzer:
 | 流通市值 | {self._format_amount(rt.get('circ_mv'))} | |
 | 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
 """
-
-        # 添加财报与分红（价值投资口径）
-        fundamental_context = context.get("fundamental_context") if isinstance(context, dict) else None
-        earnings_block = (
-            fundamental_context.get("earnings", {})
-            if isinstance(fundamental_context, dict)
-            else {}
-        )
-        earnings_data = (
-            earnings_block.get("data", {})
-            if isinstance(earnings_block, dict)
-            else {}
-        )
-        financial_report = (
-            earnings_data.get("financial_report", {})
-            if isinstance(earnings_data, dict)
-            else {}
-        )
-        dividend_metrics = (
-            earnings_data.get("dividend", {})
-            if isinstance(earnings_data, dict)
-            else {}
-        )
-        if isinstance(financial_report, dict) or isinstance(dividend_metrics, dict):
-            financial_report = financial_report if isinstance(financial_report, dict) else {}
-            dividend_metrics = dividend_metrics if isinstance(dividend_metrics, dict) else {}
-            ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
-            ttm_cash = dividend_metrics.get("ttm_cash_dividend_per_share", "N/A")
-            ttm_count = dividend_metrics.get("ttm_event_count", "N/A")
-            report_date = financial_report.get("report_date", "N/A")
-            prompt += f"""
-### 财报与分红（价值投资口径）
-| 指标 | 数值 | 说明 |
-|------|------|------|
-| 最近报告期 | {report_date} | 来自结构化财报字段 |
-| 营业收入 | {financial_report.get('revenue', 'N/A')} | |
-| 归母净利润 | {financial_report.get('net_profit_parent', 'N/A')} | |
-| 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | |
-| ROE | {financial_report.get('roe', 'N/A')} | |
-| 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径 |
-| TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |
-| TTM 分红事件数 | {ttm_count} | |
-
-> 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。
-"""
-
+        
         # 添加筹码分布数据
         if 'chip' in context:
             chip = context['chip']
@@ -1213,22 +1198,6 @@ class GeminiAnalyzer:
 """
         
         # 添加新闻搜索结果（重点区域）
-        news_window_days: Optional[int] = None
-        context_window = context.get("news_window_days")
-        try:
-            if context_window is not None:
-                parsed_window = int(context_window)
-                if parsed_window > 0:
-                    news_window_days = parsed_window
-        except (TypeError, ValueError):
-            news_window_days = None
-
-        if news_window_days is None:
-            prompt_config = get_config()
-            news_window_days = resolve_news_window_days(
-                news_max_age_days=getattr(prompt_config, "news_max_age_days", 3),
-                news_strategy_profile=getattr(prompt_config, "news_strategy_profile", "short"),
-            )
         prompt += """
 ---
 
@@ -1236,14 +1205,10 @@ class GeminiAnalyzer:
 """
         if news_context:
             prompt += f"""
-以下是 **{stock_name}({code})** 近{news_window_days}日的新闻搜索结果，请重点提取：
+以下是 **{stock_name}({code})** 近7日的新闻搜索结果，请重点提取：
 1. 🚨 **风险警报**：减持、处罚、利空
 2. 🎯 **利好催化**：业绩、合同、政策
 3. 📊 **业绩预期**：年报预告、业绩快报
-4. 🕒 **时间规则（强制）**：
-   - 输出到 `risk_alerts` / `positive_catalysts` / `latest_news` 的每一条都必须带具体日期（YYYY-MM-DD）
-   - 超出近{news_window_days}日窗口的新闻一律忽略
-   - 时间未知、无法确定发布日期的新闻一律忽略
 
 ```
 {news_context}
@@ -1298,7 +1263,6 @@ class GeminiAnalyzer:
 - **持仓分类建议**：空仓者怎么做 vs 持仓者怎么做
 - **具体狙击点位**：买入价、止损价、目标价（精确到分）
 - **检查清单**：每项用 ✅/⚠️/❌ 标记
-- **消息面时间合规**：`latest_news`、`risk_alerts`、`positive_catalysts` 不得包含超出近{news_window_days}日或时间未知的信息
 
 请输出完整的 JSON 格式决策仪表盘。"""
         prompt += """
@@ -1666,30 +1630,36 @@ class GeminiAnalyzer:
     def batch_analyze(
         self, 
         contexts: List[Dict[str, Any]],
-        delay_between: float = 2.0
+        delay_between: float = 5.0
     ) -> List[AnalysisResult]:
         """
         批量分析多只股票
-        
-        注意：为避免 API 速率限制，每次分析之间会有延迟
-        
+
+        注意：为避免 API 速率限制，每次分析之间会有延迟。
+        Gemini 免费层 RPM=15，5s 间隔可安全处理 7 只股票（约 35s 总耗时）。
+        如使用付费层或 AIHubMix 可将此值调低至 1-2s。
+
         Args:
             contexts: 上下文数据列表
-            delay_between: 每次分析之间的延迟（秒）
-            
+            delay_between: 每次分析之间的延迟（秒），默认 5.0s
+
         Returns:
             AnalysisResult 列表
         """
         results = []
-        
+        total = len(contexts)
+
         for i, context in enumerate(contexts):
+            code = context.get('code', 'Unknown')
+            logger.info(f"[batch_analyze] 开始分析 ({i+1}/{total}): {code}")
             if i > 0:
-                logger.debug(f"等待 {delay_between} 秒后继续...")
+                logger.debug(f"[batch_analyze] 等待 {delay_between}s 后继续，避免触发 LLM 限速...")
                 time.sleep(delay_between)
-            
+
             result = self.analyze(context)
             results.append(result)
-        
+
+        logger.info(f"[batch_analyze] 批量分析完成，共 {total} 只")
         return results
 
 
